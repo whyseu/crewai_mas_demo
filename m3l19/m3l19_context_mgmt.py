@@ -1,235 +1,159 @@
 """
-第19课 演示代码：上下文的生命周期——Bootstrap、剪枝与压缩
+第19课 核心模块：上下文生命周期管理
 
-演示内容：
-  1. Bootstrap：从 workspace 文件加载 soul/user/agent/memory 注入 backstory
-  2. @before_llm_call Hook：
-       - 首次调用：从 _ctx.json 恢复历史 context，追加新 user 消息
-       - 每次调用：剪枝超长 Tool Result + 超阈值时压缩
-  3. @after_llm_call Hook：
-       - 未压缩完整历史 → {session_id}_raw.jsonl（追加每次 LLM 回复）
-       - 压缩 context 快照 → {session_id}_ctx.json（覆盖写）
+包含可单元测试的纯函数（bootstrap / prune / chunk / compress / session 持久化）
+以及 XiaoPawCrew（Crew + Hooks）和 main（多轮演示入口）。
 
 运行方式：
-  # 第一轮
-  python m3l19_context_mgmt.py --session_id demo --message "帮我搜索 CrewAI 最新动态"
-  # 第二轮（自动续接上下文）
-  python m3l19_context_mgmt.py --session_id demo --message "把结果保存到文件"
-
-依赖：
-  pip install crewai duckduckgo-search requests beautifulsoup4
+  修改文件底部 SESSION_ID / DEMO_ROUNDS 后直接执行
+  cd m3l19 && python3 m3l19_context_mgmt.py
 """
 
 from __future__ import annotations
 
-import argparse
 import datetime
 import json
 import os
+import sys
 from pathlib import Path
-from typing import Any
 
 from crewai import Agent, Crew, LLM, Task
-from crewai.hooks import LLMCallHookContext, after_llm_call, before_llm_call
+from crewai.hooks import LLMCallHookContext, before_llm_call
 from crewai.project import CrewBase, agent, crew, task
-from crewai.tools import BaseTool
-from crewai_tools import FileReadTool, FileWriterTool
-from pydantic import BaseModel, Field
+from crewai_tools import FileReadTool, FileWriterTool, ScrapeWebsiteTool
+
+# ── 项目根加入 sys.path，复用 llm / tools ────────────────────────────────────
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from llm import aliyun_llm                          # noqa: E402
+from tools import BaiduSearchTool, FixedDirectoryReadTool  # noqa: E402
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1. 路径与常量配置
+# 路径与常量
 # ─────────────────────────────────────────────────────────────────────────────
 
 WORKSPACE_DIR = Path(__file__).parent / "workspace"
 SESSIONS_DIR  = WORKSPACE_DIR / "sessions"
 
-COMPRESS_THRESHOLD = 0.35   # 💡 上下文使用率超过 35% 触发压缩（比 80% 激进，主动保持干净）
-FRESH_TAIL        = 10      # 压缩时保留最近 N 轮原文（约 20 条消息）
-MODEL_CTX_LIMIT   = 32000   # fallback：qwen3-max context window
+# 💡 可调整的核心参数
+PRUNE_KEEP_TURNS   = 10      # 保留最近 N 轮原始 tool result，更早的清空占位
+COMPRESS_THRESHOLD = 0.45    # 上下文使用率超过此值触发压缩
+CHUNK_TOKENS       = 2000    # 压缩时每个 chunk 的近似 token 数
+FRESH_KEEP_TURNS   = 10      # 压缩时保留最近 N 轮不压缩
+MODEL_CTX_LIMIT    = 32000   # fallback：qwen3-max context window
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. Bootstrap：加载 workspace 文件，构建结构化 backstory
+# 1. Bootstrap：加载 workspace 文件构建 backstory
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_bootstrap_prompt(workspace_dir: Path) -> str:
     """
-    💡 核心点：只加载"导航骨架"，不把所有文件塞进去
-    soul（身份）+ user_profile（用户画像）+ agent_rules（行为规范）
-    + memory_index（200 行硬上限，防膨胀）
+    💡 核心设计：只加载"导航骨架"，不把所有文件塞进去。
+    soul（身份风格）+ user_profile（用户画像）
+    + agent_rules（SOP 知识库）+ memory_index（记忆索引，200 行上限）
     """
     parts: list[str] = []
 
     for fname, tag in [
-        ("soul.md",  "soul"),
-        ("user.md",  "user_profile"),
-        ("agent.md", "agent_rules"),
+        ("soul.md",   "soul"),
+        ("user.md",   "user_profile"),
+        ("agent.md",  "agent_rules"),
     ]:
         path = workspace_dir / fname
         if path.exists():
-            parts.append(f"<{tag}>\n{path.read_text(encoding='utf-8').strip()}\n</{tag}>")
+            parts.append(
+                f"<{tag}>\n{path.read_text(encoding='utf-8').strip()}\n</{tag}>"
+            )
 
-    memory_path = workspace_dir / "memory" / "MEMORY.md"
+    # memory.md 限制 200 行，防膨胀
+    memory_path = workspace_dir / "memory.md"
     if memory_path.exists():
-        lines = memory_path.read_text(encoding='utf-8').splitlines()[:200]  # 💡 200 行硬上限
-        parts.append(f"<memory_index>\n{chr(10).join(lines)}\n</memory_index>")
+        lines = memory_path.read_text(encoding="utf-8").splitlines()[:200]
+        parts.append(
+            f"<memory_index>\n{chr(10).join(lines)}\n</memory_index>"
+        )
 
     return "\n\n".join(parts)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. Session 持久化（两份文件）
+# 2. Session 持久化（两份文件）
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _ctx_path(session_id: str) -> Path:
-    return SESSIONS_DIR / f"{session_id}_ctx.json"
-
-def _raw_path(session_id: str) -> Path:
-    return SESSIONS_DIR / f"{session_id}_raw.jsonl"
-
-
-def load_session_ctx(session_id: str) -> list[dict]:
-    """读取压缩 context 快照（用于 session 恢复）"""
-    p = _ctx_path(session_id)
+def load_session_ctx(session_id: str, sessions_dir: Path = SESSIONS_DIR) -> list[dict]:
+    """读取压缩 context 快照，用于 session 恢复"""
+    p = sessions_dir / f"{session_id}_ctx.json"
     if not p.exists():
         return []
-    return json.loads(p.read_text(encoding='utf-8'))
+    return json.loads(p.read_text(encoding="utf-8"))
 
 
-def save_session_ctx(session_id: str, messages: list[dict]) -> None:
-    """覆盖写入当前压缩 context（每次 LLM 调用后）"""
-    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-    _ctx_path(session_id).write_text(
+def save_session_ctx(
+    session_id: str,
+    messages: list[dict],
+    sessions_dir: Path = SESSIONS_DIR,
+) -> None:
+    """覆盖写入当前压缩 context 快照"""
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    (sessions_dir / f"{session_id}_ctx.json").write_text(
         json.dumps(messages, ensure_ascii=False, indent=2),
-        encoding='utf-8'
+        encoding="utf-8",
     )
 
 
-def append_session_raw(session_id: str, role: str, content: str) -> None:
-    """追加一条记录到未压缩完整历史（append-only，保留所有中间过程）"""
-    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+def append_session_raw(
+    session_id: str,
+    role: str,
+    content: str,
+    sessions_dir: Path = SESSIONS_DIR,
+) -> None:
+    """追加一条记录到原始完整历史（append-only，保留所有中间过程）"""
+    sessions_dir.mkdir(parents=True, exist_ok=True)
     record = {
         "role":    role,
         "content": content,
         "ts":      datetime.datetime.now().isoformat(),
     }
-    with open(_raw_path(session_id), "a", encoding='utf-8') as f:
+    with open(sessions_dir / f"{session_id}_raw.jsonl", "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. 工具定义（有意返回大量文本，用于演示剪枝效果）
+# 3. 剪枝
 # ─────────────────────────────────────────────────────────────────────────────
 
-class _SaveInput(BaseModel):
-    content:  str = Field(description="要保存的内容")
-    filename: str = Field(description="文件名（不含路径），例如 summary.md")
-
-class SaveIntermediateResultTool(BaseTool):
-    name:        str = "save_intermediate_result"
-    description: str = (
-        "将中间产物或分析结果保存到 workspace 文件。"
-        "适合保存搜索摘要、分析报告等，避免重要内容留在上下文里占空间。"
-    )
-    args_schema: type[BaseModel] = _SaveInput
-
-    def _run(self, content: str, filename: str) -> str:  # type: ignore[override]
-        out = WORKSPACE_DIR / filename
-        out.write_text(content, encoding='utf-8')
-        return f"✅ 已保存到 workspace/{filename}（{len(content)} 字符）"
-
-
-class _SearchInput(BaseModel):
-    query: str = Field(description="搜索关键词（建议用英文效果更好）")
-
-class WebSearchTool(BaseTool):
-    name:        str = "web_search"
-    description: str = (
-        "搜索互联网获取最新信息，返回多条结果。"
-        "结果可能很长，使用后建议用 save_intermediate_result 保存重要内容。"
-    )
-    args_schema: type[BaseModel] = _SearchInput
-
-    def _run(self, query: str) -> str:  # type: ignore[override]
-        try:
-            from duckduckgo_search import DDGS
-            with DDGS() as ddgs:
-                results = list(ddgs.text(query, max_results=5))
-            if not results:
-                return "未找到相关结果"
-            parts = []
-            for i, r in enumerate(results, 1):
-                parts.append(
-                    f"### 结果{i}: {r.get('title', '')}\n"
-                    f"{r.get('body', '')}\n"
-                    f"来源: {r.get('href', '')}"
-                )
-            return "\n\n".join(parts)
-        except ImportError:
-            # 未安装 duckduckgo-search 时返回模拟数据（同样触发剪枝演示）
-            return (
-                f"[模拟搜索] 关于 '{query}' 的结果：\n\n"
-                + "这是模拟搜索数据。" * 300  # 💡 故意很长，演示剪枝
-            )
-
-
-class _FetchInput(BaseModel):
-    url: str = Field(description="要抓取的网页 URL")
-
-class FetchWebpageTool(BaseTool):
-    name:        str = "fetch_webpage"
-    description: str = (
-        "抓取指定网页的文本内容。返回页面正文，内容通常很长，"
-        "使用后建议保存关键摘要。"
-    )
-    args_schema: type[BaseModel] = _FetchInput
-
-    def _run(self, url: str) -> str:  # type: ignore[override]
-        try:
-            import requests
-            from bs4 import BeautifulSoup
-            resp = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-            soup = BeautifulSoup(resp.text, "html.parser")
-            for tag in soup(["script", "style", "nav", "header", "footer"]):
-                tag.decompose()
-            return soup.get_text(separator="\n", strip=True)[:8000]
-        except Exception as e:
-            return f"抓取失败：{e}"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 5. 剪枝逻辑
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _prune_tool_results(messages: list[dict]) -> None:
+def prune_tool_results(
+    messages: list[dict],
+    keep_turns: int = PRUNE_KEEP_TURNS,
+) -> None:
     """
-    💡 核心点：in-place 修改，Tool Result 是最大的上下文膨胀体
-    分级处理：< 500 不动 / 500-2000 保留 / > 2000 截断头尾
+    💡 核心设计：in-place 修改，Tool Result 是上下文膨胀的主要来源。
+    策略：找到倒数第 keep_turns 个 user 消息的位置，
+    该位置之前的所有 tool 消息内容替换为 [已剪枝]，保留消息占位和 tool_call_id。
     """
-    for i, msg in enumerate(messages):
-        if msg.get("role") != "tool":
-            continue
-        content = str(msg.get("content", ""))
-        if len(content) <= 2000:
-            continue
-        # 💡 直接修改 content 字段，不替换整个 dict（保留 tool_call_id 等字段引用）
-        messages[i]["content"] = (
-            content[:500]
-            + f"\n\n...[内容过长，已截断 {len(content) - 700} 字符]...\n\n"
-            + content[-200:]
-        )
+    user_indices = [i for i, m in enumerate(messages) if m.get("role") == "user"]
+    if len(user_indices) <= keep_turns:
+        return  # 轮数不足，无需剪枝
+
+    cutoff_idx = user_indices[-keep_turns]   # 保留点：倒数第 N 个 user 消息
+    for i in range(cutoff_idx):
+        if messages[i].get("role") == "tool":
+            messages[i]["content"] = "[已剪枝]"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6. 压缩逻辑（含 lossless flush）
+# 4. 压缩
 # ─────────────────────────────────────────────────────────────────────────────
 
 _SUMMARY_PROMPT = """\
-将以下对话历史压缩为结构化摘要，保留四类关键信息：
-1. Session Intent：用户这次想完成什么目标
-2. 关键标识符：文件路径、变量名、ID 等精确信息
-3. 操作记录：已执行的操作和结果
-4. 待办事项：尚未完成的任务
+将以下对话历史压缩为结构化摘要，只保留关键信息：
+1. 用户目标：这段对话要完成什么
+2. 关键事实：重要的结论、文件路径、操作结果
+3. 未完成事项：尚未完成的任务（如有）
 
 禁止包含：中间过程、失败尝试、重复内容。
 
@@ -238,42 +162,44 @@ _SUMMARY_PROMPT = """\
 """
 
 
-def _find_safe_split(non_system: list[dict], fresh_count: int) -> int:
+def chunk_by_tokens(
+    messages: list[dict],
+    chunk_tokens: int = CHUNK_TOKENS,
+) -> list[list[dict]]:
     """
-    💡 确保 split 点不破坏 tool message pair（assistant tool_call + tool result 必须成对）
-    策略：从目标 split 点向前扫描，找到最近的 user 消息边界
+    💡 按近似 token 数切分消息列表。
+    估算方式：中文 1 字 ≈ 1 token，英文 4 字 ≈ 1 token，取保守值 len // 2。
+    切分策略：当前 chunk 加入下一条消息后超过阈值时，先 flush 当前 chunk。
+    单条消息超阈值时独立成 chunk（不截断消息内容）。
     """
-    target = max(0, len(non_system) - fresh_count)
-    # 从 target 往前找最近的 user 消息（最干净的分割边界）
-    for i in range(target, 0, -1):
-        if non_system[i].get("role") == "user":
-            return i
-    return 0  # 找不到安全边界则不压缩
+    if not messages:
+        return []
+
+    chunks: list[list[dict]] = []
+    current: list[dict] = []
+    current_tokens = 0
+
+    for msg in messages:
+        msg_tokens = len(str(msg.get("content", ""))) // 2
+        if current_tokens + msg_tokens > chunk_tokens and current:
+            chunks.append(current)
+            current = [msg]
+            current_tokens = msg_tokens
+        else:
+            current.append(msg)
+            current_tokens += msg_tokens
+
+    if current:
+        chunks.append(current)
+
+    return chunks
 
 
-def _flush_lossless(messages: list[dict], workspace_dir: Path) -> None:
-    """
-    💡 核心点：压缩前先写磁盘（lossless 策略）
-    写入完整内容，不截断——压缩节省上下文空间，磁盘保留完整记录
-    生产环境需配套日志轮转，防止单文件无限增长
-    """
-    today    = datetime.date.today().isoformat()
-    log_path = workspace_dir / "memory" / f"{today}.md"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(log_path, "a", encoding='utf-8') as f:
-        f.write(f"\n## {datetime.datetime.now().strftime('%H:%M')} 压缩前记录\n")
-        for msg in messages:
-            role    = msg.get("role", "")
-            content = str(msg.get("content", ""))   # 💡 写入完整内容，保证 lossless
-            f.write(f"**{role}**: {content}\n\n")
-
-
-def _summarize(messages: list[dict]) -> str:
-    """用轻量模型生成结构化摘要（💡 小模型做摘要，节省成本）"""
+def _summarize_chunk(messages: list[dict]) -> str:
+    """💡 用轻量模型生成摘要，节省成本（可 mock 用于测试）"""
     summary_llm = LLM(model="qwen3-turbo")
-    # 摘要输入适当截断：不需要完整内容，节省 tokens
     history = "\n".join(
-        f"{m.get('role', '')}: {str(m.get('content', ''))[:200]}"
+        f"{m.get('role', '')}: {str(m.get('content', ''))[:300]}"
         for m in messages
     )
     return summary_llm.call([
@@ -281,84 +207,93 @@ def _summarize(messages: list[dict]) -> str:
     ])
 
 
-def _maybe_compress(messages: list[dict], context: LLMCallHookContext) -> None:
+def maybe_compress(
+    messages: list[dict],
+    context: LLMCallHookContext,
+) -> None:
     """
-    💡 核心点：in-place 修改 messages
-    策略：system 保留 → 旧消息摘要（system 角色注入）→ 最近 N 轮原文
+    💡 核心设计：in-place 修改 messages。
+    超过 COMPRESS_THRESHOLD 时：
+      ① 把旧消息按 CHUNK_TOKENS 分 chunk
+      ② 每 chunk 单独调 qwen3-turbo 生成摘要
+      ③ 用摘要（system 角色）替换原消息
+    保留：原 system 消息 + 最近 FRESH_KEEP_TURNS 轮原文。
     """
-    # 动态读取 LLM context window，fallback 到常量
-    model_limit  = getattr(context.llm, "context_window_size", MODEL_CTX_LIMIT)
+    model_limit   = getattr(context.llm, "context_window_size", MODEL_CTX_LIMIT)
     approx_tokens = sum(len(str(m.get("content", ""))) // 2 for m in messages)
-    # 💡 中文 1 字 ≈ 1 token，英文 4 字 ≈ 1 token，取保守值 //2
     if approx_tokens / model_limit < COMPRESS_THRESHOLD:
-        return  # 未到阈值，不压缩
+        return
 
     system_msgs = [m for m in messages if m.get("role") == "system"]
     non_system  = [m for m in messages if m.get("role") != "system"]
 
-    split = _find_safe_split(non_system, FRESH_TAIL * 2)
-    old   = non_system[:split]
-    fresh = non_system[split:]
+    user_indices = [i for i, m in enumerate(non_system) if m.get("role") == "user"]
+    if len(user_indices) <= FRESH_KEEP_TURNS:
+        return  # 不足以压缩，跳过
 
-    if not old:
-        return  # 没有可压缩内容
+    cutoff     = user_indices[-FRESH_KEEP_TURNS]
+    old_msgs   = non_system[:cutoff]
+    fresh_msgs = non_system[cutoff:]
 
-    _flush_lossless(old, WORKSPACE_DIR)     # 💡 压缩前先持久化
+    # 分 chunk，每 chunk 独立摘要
+    chunks       = chunk_by_tokens(old_msgs, CHUNK_TOKENS)
+    summary_msgs = [
+        {
+            "role":    "system",
+            "content": f"<context_summary>\n{_summarize_chunk(chunk)}\n</context_summary>",
+        }
+        for chunk in chunks
+    ]
 
-    summary_text = _summarize(old)
-    summary_msg = {
-        "role":    "system",                # 💡 system 角色：语义上是"背景信息"
-        "content": f"<context_summary>\n{summary_text}\n</context_summary>",
-    }
-
-    # in-place 替换：保留原 system + 摘要 + 新鲜内容
+    # in-place 替换：保留 system + 摘要 + 新鲜内容
     messages.clear()
-    messages.extend(system_msgs + [summary_msg] + fresh)
+    messages.extend(system_msgs + summary_msgs + fresh_msgs)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 7. Crew 定义
+# 5. Crew（@CrewBase 提供 hook 绑定机制）
 # ─────────────────────────────────────────────────────────────────────────────
 
 @CrewBase
 class XiaoPawCrew:
     """
-    XiaoPaw 个人助手 Crew（第19课简化版）
-    演示：Bootstrap + @before_llm_call 剪枝压缩 + @after_llm_call Session 持久化
+    XiaoPaw 个人助手（第19课）
+    演示：Bootstrap + @before_llm_call（剪枝 + 压缩）+ @after_llm_call（session 持久化）
     """
 
     def __init__(self, session_id: str, user_message: str) -> None:
-        self.session_id    = session_id
-        self.user_message  = user_message
-        self._session_loaded   = False  # 💡 flag：session 恢复只做一次（首次 LLM 调用前）
-        self._current_user_msg: dict[str, Any] = {}
+        self.session_id      = session_id
+        self.user_message    = user_message
+        self._session_loaded = False  # 💡 session 恢复只做一次（首次 LLM 调用前）
 
     @agent
     def assistant_agent(self) -> Agent:
         return Agent(
             role      = "XiaoPaw 个人助手",
-            goal      = "帮助用户高效完成工作和生活中的各类任务，主动用工具获取信息并保存成果",
-            backstory = build_bootstrap_prompt(WORKSPACE_DIR),   # 💡 Bootstrap 在这里
-            llm       = LLM(model="qwen3-max"),
-            tools     = [
-                # 💡 核心点：FileReadTool + FileWriterTool 是 crewai-tools 自带工具
-                # Agent 读取记忆文件后修改，再用 FileWriterTool 覆盖写回（overwrite=True）
-                # workspace 目录作为根路径，Agent 在 agent.md 的规范约束下决定写哪个文件
-                FileReadTool(),
+            goal      = "帮助晓寒高效完成各类任务，严谨、结果导向",
+            backstory = build_bootstrap_prompt(WORKSPACE_DIR),  # 💡 Bootstrap 在这里
+            llm       = aliyun_llm.AliyunLLM(
+                model   = "qwen3-max",
+                api_key = os.getenv("QWEN_API_KEY"),
+                region  = "cn",
+            ),
+            tools = [
+                BaiduSearchTool(),
+                ScrapeWebsiteTool(),
                 FileWriterTool(),
-                SaveIntermediateResultTool(),
-                WebSearchTool(),
-                FetchWebpageTool(),
+                FileReadTool(),
+                FixedDirectoryReadTool(directory=str(WORKSPACE_DIR)),
             ],
-            verbose   = True,
+            verbose  = True,
+            max_iter = 50,
         )
 
     @task
     def assistant_task(self) -> Task:
         return Task(
-            description     = self.user_message,
+            description     = "{user_request}",
             expected_output = "针对用户请求的完整回复",
-            agent           = self.assistant_agent,
+            agent           = self.assistant_agent(),
         )
 
     @crew
@@ -369,112 +304,130 @@ class XiaoPawCrew:
             verbose = True,
         )
 
-    # ── Pre-Model Hook：首次恢复 session + 每次剪枝压缩 ──────────────────────
+    # ── Pre-LLM Hook：session 恢复 + 剪枝 + 压缩 ─────────────────────────────
 
     @before_llm_call
     def before_llm_hook(self, context: LLMCallHookContext) -> bool | None:
         """
-        💡 核心点：在每次 LLM 调用前拦截 messages，必须 in-place 修改
-        首次：读 _ctx.json → 替换 context → 追加新 user 消息
-        每次：剪枝超长 Tool Result → 超阈值时压缩
+        💡 每次 LLM 调用前拦截，in-place 修改 context.messages。
+
+        首次调用：从 ctx.json 恢复历史 context，追加本轮 user 消息。
+        每次调用：① 剪枝旧 tool result → ② 超阈值时压缩。
+
+        ⚠️ 为什么不用 @after_llm_call：
+        crewai 的 _setup_after_llm_call_hooks 在 executor 有 after_llm_call_hooks 时，
+        会把 answer（包括 tool_calls list）str() 化后返回，
+        导致 executor 的 isinstance(answer, list) 判断失败，工具永远不执行。
+        因此改为在下一次 before_llm_call 时，从 context.messages 里读取
+        上一轮 executor 已追加的 assistant 消息来持久化。
         """
         if not self._session_loaded:
             self._restore_session(context)
             self._session_loaded = True
+        else:
+            # ── 非首次调用：把 executor 已追加的最新 assistant 消息写入 raw log ──
+            # executor 在每次 LLM 返回后会 _append_message，所以 messages 末尾
+            # 可能有新的 assistant / tool 消息，找到最后一条 assistant 消息记录
+            last_assistant = next(
+                (m for m in reversed(context.messages) if m.get("role") == "assistant"),
+                None,
+            )
+            if last_assistant:
+                content = last_assistant.get("content") or ""
+                # 只记录文字回复（非 tool call 占位）
+                if content and not str(content).strip().startswith("[{"):
+                    append_session_raw(self.session_id, "assistant", str(content))
+                    # 同步更新 ctx 快照（含本轮完整 messages）
+                    save_session_ctx(self.session_id, list(context.messages))
 
-        _prune_tool_results(context.messages)   # ① 剪枝
-        _maybe_compress(context.messages, context)  # ② 压缩
-        return None  # 返回 None 继续调用，返回 False 则阻止
+        prune_tool_results(context.messages)     # ① 剪枝
+        maybe_compress(context.messages, context)  # ② 压缩
+        return None  # 返回 None 继续调用；返回 False 则阻止 LLM 调用
 
-    # ── Post-Model Hook：保存两份 session 文件 ──────────────────────────────
-
-    @after_llm_call
-    def after_llm_hook(self, context: LLMCallHookContext) -> str | None:
-        """
-        💡 核心点：after hook 时 context.messages 不含本轮 assistant 回复
-        本轮回复在 context.response，必须手动拼入 snapshot 再保存
-        不能 append 到 context.messages（框架 _append_message 之后会再追加一次，导致重复）
-        """
-        response = context.response or ""
-
-        # ① 未压缩完整历史：追加每次 LLM 回复（含中间工具调用决策）
-        append_session_raw(self.session_id, "assistant", response)
-
-        # ② 压缩 context 快照：current messages + 本轮 assistant 回复
-        snapshot = list(context.messages) + [{"role": "assistant", "content": response}]
-        save_session_ctx(self.session_id, snapshot)
-
-        return None  # 不修改回复内容
-
-    # ── Session 恢复（首次调用时执行）────────────────────────────────────────
+    # ── 内部：session 恢复 ────────────────────────────────────────────────────
 
     def _restore_session(self, context: LLMCallHookContext) -> None:
         """
-        💡 核心点：
-        1. 取出 task-wrapped user 消息（CrewAI 渲染为 "\nCurrent Task: ..."）
-        2. 写入 raw log（user 消息只记录一次）
-        3. 用历史 ctx 替换 context.messages，追加新 user 消息
-           → Agent 看到的是连续的上下文，感知不到 session 中断
+        💡 取出 CrewAI 渲染的 user 消息 → 写入 raw log
+        → 用历史 ctx 替换 context.messages + 追加新 user 消息。
+        Agent 感知不到 session 中断，看到的是连续的上下文。
         """
-        # 取出当前 user 消息（CrewAI task 渲染后注入的，位于 messages 末尾）
-        self._current_user_msg = next(
+        # 取出当前轮 user 消息（CrewAI 将 task description 渲染后注入，在末尾）
+        current_user_msg = next(
             (m for m in reversed(context.messages) if m.get("role") == "user"),
             {},
         )
-        if self._current_user_msg:
+        if current_user_msg:
             append_session_raw(
-                self.session_id, "user",
-                str(self._current_user_msg.get("content", "")),
+                self.session_id,
+                "user",
+                str(current_user_msg.get("content", "")),
             )
 
-        # 读取历史 context 快照
         history = load_session_ctx(self.session_id)
         if not history:
-            return  # 第一次对话，无历史，直接用 CrewAI 初始化的 messages
+            return  # 全新 session，无历史
 
-        # 💡 替换：历史 messages + 新 user 消息 → Agent 看到连续上下文
+        # 💡 替换：历史 context + 新 user 消息 = Agent 看到连续上下文
         context.messages.clear()
         context.messages.extend(history)
-        if self._current_user_msg:
-            context.messages.append(self._current_user_msg)
+        if current_user_msg:
+            context.messages.append(current_user_msg)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 8. 入口
+# 6. 运行参数 & Main（多轮演示）
 # ─────────────────────────────────────────────────────────────────────────────
+
+SESSION_ID = "demo"
+
+DEMO_ROUNDS = [
+    (
+        "调研任务",
+        "帮我调研极客时间平台上多智能体相关课程的现状，生成一份调研报告保存到文件",
+    ),
+    (
+        "结论提炼",
+        "把刚才报告里的关键结论总结成3条，方便我发给同事",
+    ),
+    (
+        "周报生成",
+        "帮我写本周工作总结，从记忆文件里读本周做了什么，保存到文件",
+    ),
+]
+
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="XiaoPaw 个人助手（第19课演示：上下文生命周期管理）"
-    )
-    parser.add_argument("--session_id", required=True,
-                        help="会话 ID（相同 ID 可续接上下文，不同 ID 全新开始）")
-    parser.add_argument("--message",    required=True,
-                        help="用户消息")
-    args = parser.parse_args()
+    ctx_file = SESSIONS_DIR / f"{SESSION_ID}_ctx.json"
 
     print(f"\n{'='*60}")
-    print(f"Session : {args.session_id}")
-    print(f"Message : {args.message}")
-    ctx_file = _ctx_path(args.session_id)
+    print("XiaoPaw 助手 - 第19课：上下文生命周期管理")
+    print(f"{'='*60}")
+    print(f"Session ID : {SESSION_ID}")
     if ctx_file.exists():
         saved = json.loads(ctx_file.read_text())
-        print(f"历史消息: {len(saved)} 条（将恢复上下文）")
+        print(f"历史消息   : {len(saved)} 条（将恢复上下文）")
     else:
-        print("历史消息: 无（全新 session）")
-    print(f"{'='*60}\n")
+        print("历史消息   : 无（全新 session）")
 
-    result = XiaoPawCrew(
-        session_id   = args.session_id,
-        user_message = args.message,
-    ).crew().kickoff(inputs={"user_message": args.message})
+    for i, (label, message) in enumerate(DEMO_ROUNDS, 1):
+        print(f"\n{'─'*60}")
+        print(f"Round {i}/{len(DEMO_ROUNDS)}  [{label}]")
+        print(f"用户消息   : {message}")
+        print(f"{'─'*60}\n")
+
+        result = XiaoPawCrew(SESSION_ID, message).crew().kickoff(
+            inputs={"user_request": message}
+        )
+
+        print(f"\n{'─'*60}")
+        print(f"回复：\n{result.raw}")
 
     print(f"\n{'='*60}")
-    print(f"回复：\n{result.raw}")
+    print("Session 文件：")
+    print(f"  ctx  → {SESSIONS_DIR / f'{SESSION_ID}_ctx.json'}")
+    print(f"  raw  → {SESSIONS_DIR / f'{SESSION_ID}_raw.jsonl'}")
     print(f"{'='*60}")
-    print(f"\nSession 文件：")
-    print(f"  ctx  → {_ctx_path(args.session_id)}")
-    print(f"  raw  → {_raw_path(args.session_id)}")
 
 
 if __name__ == "__main__":

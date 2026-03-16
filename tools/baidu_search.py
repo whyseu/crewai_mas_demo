@@ -54,7 +54,7 @@ class BaiduSearchInput(BaseModel):
     )
     top_k: Optional[int] = Field(
         20,
-        description="返回的搜索结果数量，默认20，在精确信息搜索时推荐5以下，广泛调研时10以上。"
+        description="返回的搜索结果数量，默认20，在精确信息搜索时推荐5以下，广泛调研时10以上。注意生成int型参数，如：{'top_k': 10}，不要生成字符串型参数，如：{'top_k': '10'}"
     )
     recency_filter: Optional[Literal["week", "month", "semiyear", "year"]] = Field(
         None,
