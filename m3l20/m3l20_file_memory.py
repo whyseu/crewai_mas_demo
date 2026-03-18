@@ -10,7 +10,7 @@
 与 m3l19 的区别：
   - 移除 FileWriterTool / FileReadTool（文件操作委托给沙盒 Sub-Crew）
   - 加入 SkillLoaderTool(sandbox_mount_desc=M3L20_SANDBOX_MOUNT_DESC)
-  - 继承 m3l19 的 Bootstrap / 剪枝 / 压缩纯函数，一行不改n
+  - 继承 m3l19 的 Bootstrap / 剪枝 / 压缩纯函数，一行不改
 
 运行前：
   1. 启动 m3l20 专用沙盒：docker compose -f sandbox-docker-compose.yaml up -d
@@ -265,7 +265,7 @@ class XiaoPawCrew:
     XiaoPaw 个人助手（第20课）
 
     与 m3l19 的关键区别：
-    - tools 只有 SkillLoaderTool（传入 M3L20_SANDBOX_MOUNT_DESC）
+    - tools：SkillLoaderTool（传入 M3L20_SANDBOX_MOUNT_DESC）+ BaiduSearchTool
     - 移除 FileWriterTool / FileReadTool：文件操作全部委托给 AIO-Sandbox Sub-Crew
     - @before_llm_call hook 完全继承 m3l19，一行不改
     """
